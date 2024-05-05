@@ -4,6 +4,7 @@
  */
 
 #include <linux/prandom.h>
+#include <linux/version.h>
 
 #include <uapi/drm/i915_drm.h>
 
@@ -38,7 +39,11 @@ static int __iopagetest(struct intel_memory_region *mem,
 			u8 value, resource_size_t offset,
 			const void *caller)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,6)
+	int byte = get_random_u32_below(pagesize);
+#else
 	int byte = prandom_u32_max(pagesize);
+#endif
 	u8 result[3];
 
 	memset_io(va, value, pagesize); /* or GPF! */
@@ -92,7 +97,11 @@ static int iopagetest(struct intel_memory_region *mem,
 static resource_size_t random_page(resource_size_t last)
 {
 	/* Limited to low 44b (16TiB), but should suffice for a spot check */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,6)
+	return get_random_u32_below(last >> PAGE_SHIFT) << PAGE_SHIFT;
+#else
 	return prandom_u32_max(last >> PAGE_SHIFT) << PAGE_SHIFT;
+#endif
 }
 
 static int iomemtest(struct intel_memory_region *mem,
@@ -198,8 +207,7 @@ void intel_memory_region_debug(struct intel_memory_region *mr,
 	if (mr->region_private)
 		ttm_resource_manager_debug(mr->region_private, printer);
 	else
-		drm_printf(printer, "total:%pa, available:%pa bytes\n",
-			   &mr->total, &mr->avail);
+		drm_printf(printer, "total:%pa bytes\n", &mr->total);
 }
 
 static int intel_memory_region_memtest(struct intel_memory_region *mem,
@@ -236,13 +244,12 @@ intel_memory_region_create(struct drm_i915_private *i915,
 		return ERR_PTR(-ENOMEM);
 
 	mem->i915 = i915;
-	mem->region = (struct resource)DEFINE_RES_MEM(start, size);
+	mem->region = DEFINE_RES_MEM(start, size);
 	mem->io_start = io_start;
 	mem->io_size = io_size;
 	mem->min_page_size = min_page_size;
 	mem->ops = ops;
 	mem->total = size;
-	mem->avail = mem->total;
 	mem->type = type;
 	mem->instance = instance;
 
@@ -277,6 +284,20 @@ void intel_memory_region_set_name(struct intel_memory_region *mem,
 	va_start(ap, fmt);
 	vsnprintf(mem->name, sizeof(mem->name), fmt, ap);
 	va_end(ap);
+}
+
+void intel_memory_region_avail(struct intel_memory_region *mr,
+			       u64 *avail, u64 *visible_avail)
+{
+	if (mr->type == INTEL_MEMORY_LOCAL) {
+		i915_ttm_buddy_man_avail(mr->region_private,
+					 avail, visible_avail);
+		*avail <<= PAGE_SHIFT;
+		*visible_avail <<= PAGE_SHIFT;
+	} else {
+		*avail = mr->total;
+		*visible_avail = mr->total;
+	}
 }
 
 void intel_memory_region_destroy(struct intel_memory_region *mem)

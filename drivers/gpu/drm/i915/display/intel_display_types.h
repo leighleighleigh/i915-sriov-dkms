@@ -30,6 +30,7 @@
 #include <linux/pm_qos.h>
 #include <linux/pwm.h>
 #include <linux/sched/clock.h>
+#include <linux/version.h>
 
 #include <drm/display/drm_dp_dual_mode_helper.h>
 #include <drm/display/drm_dp_mst_helper.h>
@@ -43,13 +44,18 @@
 #include <drm/drm_rect.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_vblank_work.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
+#include <drm/i915_hdcp_interface.h>
+#else
 #include <drm/i915_mei_hdcp_interface.h>
+#endif
 #include <media/cec-notifier.h>
 
 #include "i915_vma.h"
 #include "i915_vma_types.h"
 #include "intel_bios.h"
 #include "intel_display.h"
+#include "intel_display_limits.h"
 #include "intel_display_power.h"
 #include "intel_dpll_mgr.h"
 #include "intel_pm_types.h"
@@ -105,7 +111,7 @@ struct intel_fb_view {
 	 * In the normal view the FB object's backing store sg list is used
 	 * directly and hence the remap information here is not used.
 	 */
-	struct i915_ggtt_view gtt;
+	struct i915_gtt_view gtt;
 
 	/*
 	 * The GTT view (gtt.type) specific information for each FB color
@@ -262,8 +268,6 @@ struct intel_encoder {
 
 	enum hpd_pin hpd_pin;
 	enum intel_display_power_domain power_domain;
-	/* for communication with audio component; protected by av_mutex */
-	const struct drm_connector *audio_connector;
 
 	/* VBT information for this encoder (may be NULL for older platforms) */
 	const struct intel_bios_encoder_data *devdata;
@@ -280,7 +284,80 @@ struct intel_panel_bl_funcs {
 	u32 (*hz_to_pwm)(struct intel_connector *connector, u32 hz);
 };
 
+enum drrs_type {
+	DRRS_TYPE_NONE,
+	DRRS_TYPE_STATIC,
+	DRRS_TYPE_SEAMLESS,
+};
+
+struct intel_vbt_panel_data {
+	struct drm_display_mode *lfp_lvds_vbt_mode; /* if any */
+	struct drm_display_mode *sdvo_lvds_vbt_mode; /* if any */
+
+	/* Feature bits */
+	int panel_type;
+	unsigned int lvds_dither:1;
+	unsigned int bios_lvds_val; /* initial [PCH_]LVDS reg val in VBIOS */
+
+	bool vrr;
+
+	u8 seamless_drrs_min_refresh_rate;
+	enum drrs_type drrs_type;
+
+	struct {
+		int max_link_rate;
+		int rate;
+		int lanes;
+		int preemphasis;
+		int vswing;
+		int bpp;
+		struct edp_power_seq pps;
+		u8 drrs_msa_timing_delay;
+		bool low_vswing;
+		bool initialized;
+		bool hobl;
+	} edp;
+
+	struct {
+		bool enable;
+		bool full_link;
+		bool require_aux_wakeup;
+		int idle_frames;
+		int tp1_wakeup_time_us;
+		int tp2_tp3_wakeup_time_us;
+		int psr2_tp2_tp3_wakeup_time_us;
+	} psr;
+
+	struct {
+		u16 pwm_freq_hz;
+		u16 brightness_precision_bits;
+		bool present;
+		bool active_low_pwm;
+		u8 min_brightness;	/* min_brightness/255 of max */
+		s8 controller;		/* brightness controller number */
+		enum intel_backlight_type type;
+	} backlight;
+
+	/* MIPI DSI */
+	struct {
+		u16 panel_id;
+		struct mipi_config *config;
+		struct mipi_pps_data *pps;
+		u16 bl_ports;
+		u16 cabc_ports;
+		u8 seq_version;
+		u32 size;
+		u8 *data;
+		const u8 *sequence[MIPI_SEQ_MAX];
+		u8 *deassert_seq; /* Used by fixup_mipi_sequences() */
+		enum drm_panel_orientation orientation;
+	} dsi;
+};
+
 struct intel_panel {
+	/* Fixed EDID for eDP and LVDS. May hold ERR_PTR for invalid EDID. */
+	const struct drm_edid *fixed_edid;
+
 	struct list_head fixed_modes;
 
 	/* backlight */
@@ -319,6 +396,8 @@ struct intel_panel {
 		const struct intel_panel_bl_funcs *pwm_funcs;
 		void (*power)(struct intel_connector *, bool enable);
 	} backlight;
+
+	struct intel_vbt_panel_data vbt;
 };
 
 struct intel_digital_port;
@@ -519,9 +598,8 @@ struct intel_connector {
 	/* Panel info for eDP and LVDS */
 	struct intel_panel panel;
 
-	/* Cached EDID for eDP and LVDS. May hold ERR_PTR for invalid EDID. */
-	struct edid *edid;
-	struct edid *detect_edid;
+	/* Cached EDID for detect. */
+	const struct drm_edid *detect_edid;
 
 	/* Number of times hotplug detection was tried after an HPD interrupt */
 	int hotplug_retries;
@@ -897,6 +975,37 @@ struct intel_mpllb_state {
 	u32 mpllb_sscstep;
 };
 
+/* Used by dp and fdi links */
+struct intel_link_m_n {
+	u32 tu;
+	u32 data_m;
+	u32 data_n;
+	u32 link_m;
+	u32 link_n;
+};
+
+struct intel_c10mpllb_state {
+	u32 clock; /* in KHz */
+	u8 pll[20];
+};
+
+struct intel_c20pll_state {
+	u32 clock; /* in kHz */
+	u16 tx[3];
+	u16 cmn[4];
+	union {
+		u16 mplla[10];
+		u16 mpllb[11];
+	};
+};
+
+struct intel_cx0pll_state {
+	union {
+		struct intel_c10mpllb_state c10mpllb_state;
+		struct intel_c20pll_state c20pll_state;
+	};
+};
+
 struct intel_crtc_state {
 	/*
 	 * uapi (drm) state. This is the software state shown to userspace.
@@ -929,10 +1038,14 @@ struct intel_crtc_state {
 	 */
 	struct {
 		bool active, enable;
+		/* logical state of LUTs */
 		struct drm_property_blob *degamma_lut, *gamma_lut, *ctm;
 		struct drm_display_mode mode, pipe_mode, adjusted_mode;
 		enum drm_scaling_filter scaling_filter;
 	} hw;
+
+	/* actual state of LUTs */
+	struct drm_property_blob *pre_csc_lut, *post_csc_lut;
 
 	/**
 	 * quirks - bitfield with hw state readout quirks
@@ -1036,6 +1149,7 @@ struct intel_crtc_state {
 	union {
 		struct intel_dpll_hw_state dpll_hw_state;
 		struct intel_mpllb_state mpllb_state;
+		struct intel_cx0pll_state cx0pll_state;
 	};
 
 	/*
@@ -1058,6 +1172,7 @@ struct intel_crtc_state {
 	/* m2_n2 for eDP downclock */
 	struct intel_link_m_n dp_m2_n2;
 	bool has_drrs;
+	bool seamless_m_n;
 
 	/* PSR is supported but might not be enabled due the lack of enabled planes */
 	bool has_psr;
@@ -1162,6 +1277,9 @@ struct intel_crtc_state {
 	/* bitmask of planes that will be updated during the commit */
 	u8 update_planes;
 
+	/* bitmask of planes with async flip active */
+	u8 async_flip_planes;
+
 	u8 framestart_delay; /* 1-4 */
 	u8 msa_timing_delay; /* 0-3 */
 
@@ -1174,6 +1292,8 @@ struct intel_crtc_state {
 		union hdmi_infoframe drm;
 		struct drm_dp_vsc_sdp vsc;
 	} infoframes;
+
+	u8 eld[MAX_ELD_BYTES];
 
 	/* HDMI scrambling status */
 	bool hdmi_scrambling;
@@ -1208,6 +1328,8 @@ struct intel_crtc_state {
 
 	/* Forward Error correction State */
 	bool fec_enable;
+
+	bool sdp_split_enable;
 
 	/* Pointer to master transcoder in case of tiled displays */
 	enum transcoder master_transcoder;
@@ -1289,6 +1411,7 @@ struct intel_crtc {
 	u16 vmax_vblank_start;
 
 	struct intel_display_power_domain_set enabled_power_domains;
+	struct intel_display_power_domain_set hw_readout_power_domains;
 	struct intel_overlay *overlay;
 
 	struct intel_crtc_state *config;
@@ -1475,16 +1598,25 @@ struct intel_pps {
 	int backlight_off_delay;
 	struct delayed_work panel_vdd_work;
 	bool want_panel_vdd;
+	bool initializing;
 	unsigned long last_power_on;
 	unsigned long last_backlight_off;
 	ktime_t panel_power_off_time;
 	intel_wakeref_t vdd_wakeref;
 
-	/*
-	 * Pipe whose power sequencer is currently locked into
-	 * this port. Only relevant on VLV/CHV.
-	 */
-	enum pipe pps_pipe;
+	union {
+		/*
+		 * Pipe whose power sequencer is currently locked into
+		 * this port. Only relevant on VLV/CHV.
+		 */
+		enum pipe pps_pipe;
+
+		/*
+		 * Power sequencer index. Only relevant on BXT+.
+		 */
+		int pps_idx;
+	};
+
 	/*
 	 * Pipe currently driving the port. Used for preventing
 	 * the use of the PPS for any pipe currentrly driving
@@ -1493,10 +1625,11 @@ struct intel_pps {
 	enum pipe active_pipe;
 	/*
 	 * Set if the sequencer may be reset due to a power transition,
-	 * requiring a reinitialization. Only relevant on BXT.
+	 * requiring a reinitialization. Only relevant on BXT+.
 	 */
 	bool pps_reset;
 	struct edp_power_seq pps_delays;
+	struct edp_power_seq bios_pps_delays;
 };
 
 struct intel_psr {
@@ -1529,6 +1662,8 @@ struct intel_psr {
 	bool psr2_sel_fetch_cff_enabled;
 	bool req_psr2_sdp_prior_scanline;
 	u8 sink_sync_latency;
+	u8 io_wake_lines;
+	u8 fast_wake_lines;
 	ktime_t last_entry_attempt;
 	ktime_t last_exit;
 	bool sink_not_reliable;
@@ -1638,7 +1773,7 @@ struct intel_dp {
 
 	/* Display stream compression testing */
 	bool force_dsc_en;
-	int force_dsc_bpp;
+	int force_dsc_bpc;
 
 	bool hobl_failed;
 	bool hobl_active;
@@ -1723,48 +1858,6 @@ struct intel_dp_mst_encoder {
 	struct intel_digital_port *primary;
 	struct intel_connector *connector;
 };
-
-static inline enum dpio_channel
-vlv_dig_port_to_channel(struct intel_digital_port *dig_port)
-{
-	switch (dig_port->base.port) {
-	case PORT_B:
-	case PORT_D:
-		return DPIO_CH0;
-	case PORT_C:
-		return DPIO_CH1;
-	default:
-		BUG();
-	}
-}
-
-static inline enum dpio_phy
-vlv_dig_port_to_phy(struct intel_digital_port *dig_port)
-{
-	switch (dig_port->base.port) {
-	case PORT_B:
-	case PORT_C:
-		return DPIO_PHY0;
-	case PORT_D:
-		return DPIO_PHY1;
-	default:
-		BUG();
-	}
-}
-
-static inline enum dpio_channel
-vlv_pipe_to_channel(enum pipe pipe)
-{
-	switch (pipe) {
-	case PIPE_A:
-	case PIPE_C:
-		return DPIO_CH0;
-	case PIPE_B:
-		return DPIO_CH1;
-	default:
-		BUG();
-	}
-}
 
 struct intel_load_detect_pipe {
 	struct drm_atomic_state *restore_state;
@@ -1962,21 +2055,36 @@ static inline bool
 intel_crtc_has_type(const struct intel_crtc_state *crtc_state,
 		    enum intel_output_type type)
 {
-	return crtc_state->output_types & (1 << type);
+	return crtc_state->output_types & BIT(type);
 }
+
 static inline bool
 intel_crtc_has_dp_encoder(const struct intel_crtc_state *crtc_state)
 {
 	return crtc_state->output_types &
-		((1 << INTEL_OUTPUT_DP) |
-		 (1 << INTEL_OUTPUT_DP_MST) |
-		 (1 << INTEL_OUTPUT_EDP));
+		(BIT(INTEL_OUTPUT_DP) |
+		 BIT(INTEL_OUTPUT_DP_MST) |
+		 BIT(INTEL_OUTPUT_EDP));
 }
 
 static inline bool
 intel_crtc_needs_modeset(const struct intel_crtc_state *crtc_state)
 {
 	return drm_atomic_crtc_needs_modeset(&crtc_state->uapi);
+}
+
+static inline bool
+intel_crtc_needs_fastset(const struct intel_crtc_state *crtc_state)
+{
+	return crtc_state->update_pipe;
+}
+
+static inline bool
+intel_crtc_needs_color_update(const struct intel_crtc_state *crtc_state)
+{
+	return crtc_state->uapi.color_mgmt_changed ||
+		intel_crtc_needs_fastset(crtc_state) ||
+		intel_crtc_needs_modeset(crtc_state);
 }
 
 static inline u32 intel_plane_ggtt_offset(const struct intel_plane_state *plane_state)

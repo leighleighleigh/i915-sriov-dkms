@@ -88,7 +88,12 @@ typedef u64 gen8_pte_t;
 #define BYT_PTE_SNOOPED_BY_CPU_CACHES	REG_BIT(2)
 #define BYT_PTE_WRITEABLE		REG_BIT(1)
 
+#define GEN12_PPGTT_PTE_PAT3    BIT_ULL(62)
 #define GEN12_PPGTT_PTE_LM	BIT_ULL(11)
+#define GEN12_PPGTT_PTE_PAT2    BIT_ULL(7)
+#define GEN12_PPGTT_PTE_NC      BIT_ULL(5)
+#define GEN12_PPGTT_PTE_PAT1    BIT_ULL(4)
+#define GEN12_PPGTT_PTE_PAT0    BIT_ULL(3)
 
 /*
  *  DOC: GEN12 GGTT Table Entry format
@@ -98,13 +103,26 @@ typedef u64 gen8_pte_t;
  * +==========+=========+=========+=================+==============+=========+
  * |  Ignored | Address | Ignored | Function Number | Local Memory | Present |
  * +----------+---------+---------+-----------------+--------------+---------+
+ *
+ * ADL-P/S:
+ * +----------+--------------+-------------------+---------+---------+----------+--------+---------+
+ * |    63:46 |        45:42 |             41:39 |   38:12 |   11:5  |      4:2 |      1 |       0 |
+ * +==========+==============+===================+=========+=========+==========+========+=========+
+ * |  Ignored | MKTME key ID | 2LM Far Memory    | Address | Ignored | Function | Local  | Present |
+ * |          |              | address extension |         |         | Number   | Memory |         |
+ * +----------+--------------+-------------------+---------+---------+----------+--------+---------+
+ *
  */
 
 #define GEN12_GGTT_PTE_LM		BIT_ULL(1)
+#define MTL_GGTT_PTE_PAT0		BIT_ULL(52)
+#define MTL_GGTT_PTE_PAT1		BIT_ULL(53)
 #define TGL_GGTT_PTE_VFID_MASK		GENMASK_ULL(4, 2)
 #define GEN12_GGTT_PTE_ADDR_MASK	GENMASK_ULL(45, 12)
+#define MTL_GGTT_PTE_PAT_MASK		GENMASK_ULL(53, 52)
 
 #define GEN12_PDE_64K BIT(6)
+#define GEN12_PTE_PS64 BIT(8)
 
 /*
  * Cacheability Control is a 4-bit value. The low three bits are stored in bits
@@ -158,7 +176,14 @@ typedef u64 gen8_pte_t;
 #define GEN8_PDE_IPS_64K BIT(11)
 #define GEN8_PDE_PS_2M   BIT(7)
 
-enum i915_cache_level;
+#define MTL_PPAT_L4_CACHE_POLICY_MASK	REG_GENMASK(3, 2)
+#define MTL_PAT_INDEX_COH_MODE_MASK	REG_GENMASK(1, 0)
+#define MTL_PPAT_L4_3_UC	REG_FIELD_PREP(MTL_PPAT_L4_CACHE_POLICY_MASK, 3)
+#define MTL_PPAT_L4_1_WT	REG_FIELD_PREP(MTL_PPAT_L4_CACHE_POLICY_MASK, 1)
+#define MTL_PPAT_L4_0_WB	REG_FIELD_PREP(MTL_PPAT_L4_CACHE_POLICY_MASK, 0)
+#define MTL_3_COH_2W	REG_FIELD_PREP(MTL_PAT_INDEX_COH_MODE_MASK, 3)
+#define MTL_2_COH_1W	REG_FIELD_PREP(MTL_PAT_INDEX_COH_MODE_MASK, 2)
+#define MTL_0_COH_NON	REG_FIELD_PREP(MTL_PAT_INDEX_COH_MODE_MASK, 0)
 
 struct drm_i915_gem_object;
 struct i915_fence_reg;
@@ -227,7 +252,7 @@ struct i915_vma_ops {
 	void (*bind_vma)(struct i915_address_space *vm,
 			 struct i915_vm_pt_stash *stash,
 			 struct i915_vma_resource *vma_res,
-			 enum i915_cache_level cache_level,
+			 unsigned int pat_index,
 			 u32 flags);
 	/*
 	 * Unmap an object from an address space. This usually consists of
@@ -299,7 +324,7 @@ struct i915_address_space {
 		(*alloc_scratch_dma)(struct i915_address_space *vm, int sz);
 
 	u64 (*pte_encode)(dma_addr_t addr,
-			  enum i915_cache_level level,
+			  unsigned int pat_index,
 			  u32 flags); /* Create a valid PTE */
 #define PTE_READ_ONLY	BIT(0)
 #define PTE_LM		BIT(1)
@@ -312,12 +337,21 @@ struct i915_address_space {
 	void (*insert_page)(struct i915_address_space *vm,
 			    dma_addr_t addr,
 			    u64 offset,
-			    enum i915_cache_level cache_level,
+			    unsigned int pat_index,
 			    u32 flags);
 	void (*insert_entries)(struct i915_address_space *vm,
 			       struct i915_vma_resource *vma_res,
-			       enum i915_cache_level cache_level,
+			       unsigned int pat_index,
 			       u32 flags);
+	void (*raw_insert_page)(struct i915_address_space *vm,
+				dma_addr_t addr,
+				u64 offset,
+				unsigned int pat_index,
+				u32 flags);
+	void (*raw_insert_entries)(struct i915_address_space *vm,
+				   struct i915_vma_resource *vma_res,
+				   unsigned int pat_index,
+				   u32 flags);
 	void (*cleanup)(struct i915_address_space *vm);
 
 	void (*foreach)(struct i915_address_space *vm,
@@ -376,13 +410,12 @@ struct i915_ggtt {
 	 */
 	struct list_head userfault_list;
 
-	/* Manual runtime pm autosuspend delay for user GGTT mmaps */
-	struct intel_wakeref_auto userfault_wakeref;
-
 	struct mutex error_mutex;
 	struct drm_mm_node error_capture;
 	struct drm_mm_node uc_fw;
-	struct drm_mm_node balloon[4];
+
+	/** List of GTs mapping this GGTT */
+	struct list_head gt_list;
 };
 
 struct i915_ppgtt {
@@ -561,15 +594,21 @@ i915_page_dir_dma_addr(const struct i915_ppgtt *ppgtt, const unsigned int n)
 
 void ppgtt_init(struct i915_ppgtt *ppgtt, struct intel_gt *gt,
 		unsigned long lmem_pt_obj_flags);
+void intel_ggtt_bind_vma(struct i915_address_space *vm,
+			 struct i915_vm_pt_stash *stash,
+			 struct i915_vma_resource *vma_res,
+			 unsigned int pat_index,
+			 u32 flags);
+void intel_ggtt_unbind_vma(struct i915_address_space *vm,
+			   struct i915_vma_resource *vma_res);
 
 int i915_ggtt_probe_hw(struct drm_i915_private *i915);
 int i915_ggtt_init_hw(struct drm_i915_private *i915);
 int i915_ggtt_enable_hw(struct drm_i915_private *i915);
-void i915_ggtt_enable_guc(struct i915_ggtt *ggtt);
-void i915_ggtt_disable_guc(struct i915_ggtt *ggtt);
 int i915_init_ggtt(struct drm_i915_private *i915);
 void i915_ggtt_driver_release(struct drm_i915_private *i915);
 void i915_ggtt_driver_late_release(struct drm_i915_private *i915);
+struct i915_ggtt *i915_ggtt_create(struct drm_i915_private *i915);
 
 static inline bool i915_ggtt_has_aperture(const struct i915_ggtt *ggtt)
 {
@@ -582,17 +621,6 @@ void i915_ggtt_deballoon(struct i915_ggtt *ggtt, struct drm_mm_node *node);
 
 void i915_ggtt_set_space_owner(struct i915_ggtt *ggtt, u16 vfid,
 			       const struct drm_mm_node *node);
-
-#define I915_GGTT_SAVE_PTES_NO_VFID BIT(31)
-
-int i915_ggtt_save_ptes(struct i915_ggtt *ggtt, const struct drm_mm_node *node, void *buf,
-			unsigned int size, unsigned int flags);
-
-#define I915_GGTT_RESTORE_PTES_NEW_VFID  BIT(31)
-#define I915_GGTT_RESTORE_PTES_VFID_MASK GENMASK(19, 0)
-
-int i915_ggtt_restore_ptes(struct i915_ggtt *ggtt, const struct drm_mm_node *node, const void *buf,
-			   unsigned int size, unsigned int flags);
 
 int i915_ppgtt_init_hw(struct intel_gt *gt);
 
@@ -634,10 +662,10 @@ void
 __set_pd_entry(struct i915_page_directory * const pd,
 	       const unsigned short idx,
 	       struct i915_page_table *pt,
-	       u64 (*encode)(const dma_addr_t, const enum i915_cache_level));
+	       u64 (*encode)(const dma_addr_t, const unsigned int pat_index));
 
 #define set_pd_entry(pd, idx, to) \
-	__set_pd_entry((pd), (idx), px_pt(to), gen8_pde_encode)
+	__set_pd_entry((pd), (idx), px_pt(to), gen8_pde_encode_shim)
 
 void
 clear_pd_entry(struct i915_page_directory * const pd,
@@ -651,22 +679,17 @@ release_pd_entry(struct i915_page_directory * const pd,
 		 const struct drm_i915_gem_object * const scratch);
 void gen6_ggtt_invalidate(struct i915_ggtt *ggtt);
 
-void gen8_set_pte(void __iomem *addr, gen8_pte_t pte);
-gen8_pte_t gen8_get_pte(void __iomem *addr);
-
-u64 ggtt_addr_to_pte_offset(u64 ggtt_addr);
-
 void ppgtt_bind_vma(struct i915_address_space *vm,
 		    struct i915_vm_pt_stash *stash,
 		    struct i915_vma_resource *vma_res,
-		    enum i915_cache_level cache_level,
+		    unsigned int pat_index,
 		    u32 flags);
 void ppgtt_unbind_vma(struct i915_address_space *vm,
 		      struct i915_vma_resource *vma_res);
 
 void gtt_write_workarounds(struct intel_gt *gt);
 
-void setup_private_pat(struct intel_uncore *uncore);
+void setup_private_pat(struct intel_gt *gt);
 
 int i915_vm_alloc_pt_stash(struct i915_address_space *vm,
 			   struct i915_vm_pt_stash *stash,

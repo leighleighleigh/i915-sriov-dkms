@@ -4,6 +4,7 @@
  * Copyright © 2014-2016 Intel Corporation
  */
 
+#include "display/intel_display.h"
 #include "display/intel_frontbuffer.h"
 #include "gt/intel_gt.h"
 
@@ -17,6 +18,8 @@
 #include "i915_gem_object.h"
 #include "i915_vma.h"
 
+#define VTD_GUARD (168u * I915_GTT_PAGE_SIZE) /* 168 or tile-row PTE padding */
+
 static bool gpu_write_needs_clflush(struct drm_i915_gem_object *obj)
 {
 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
@@ -24,8 +27,8 @@ static bool gpu_write_needs_clflush(struct drm_i915_gem_object *obj)
 	if (IS_DGFX(i915))
 		return false;
 
-	return !(obj->cache_level == I915_CACHE_NONE ||
-		 obj->cache_level == I915_CACHE_WT);
+	return !(i915_gem_object_has_cache_level(obj, I915_CACHE_NONE) ||
+		 i915_gem_object_has_cache_level(obj, I915_CACHE_WT));
 }
 
 bool i915_gem_cpu_write_needs_clflush(struct drm_i915_gem_object *obj)
@@ -35,11 +38,11 @@ bool i915_gem_cpu_write_needs_clflush(struct drm_i915_gem_object *obj)
 	if (obj->cache_dirty)
 		return false;
 
-	if (!(obj->cache_coherent & I915_BO_CACHE_COHERENT_FOR_WRITE))
-		return true;
-
 	if (IS_DGFX(i915))
 		return false;
+
+	if (!(obj->cache_coherent & I915_BO_CACHE_COHERENT_FOR_WRITE))
+		return true;
 
 	/* Currently in use by HW (display engine)? Keep flushed. */
 	return i915_gem_object_is_framebuffer(obj);
@@ -262,7 +265,7 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
 {
 	int ret;
 
-	if (obj->cache_level == cache_level)
+	if (i915_gem_object_has_cache_level(obj, cache_level))
 		return 0;
 
 	ret = i915_gem_object_wait(obj,
@@ -273,10 +276,8 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
 		return ret;
 
 	/* Always invalidate stale cachelines */
-	if (obj->cache_level != cache_level) {
-		i915_gem_object_set_cache_coherency(obj, cache_level);
-		obj->cache_dirty = true;
-	}
+	i915_gem_object_set_cache_coherency(obj, cache_level);
+	obj->cache_dirty = true;
 
 	/* The cache-level will be applied when each vma is rebound. */
 	return i915_gem_object_unbind(obj,
@@ -301,20 +302,13 @@ int i915_gem_get_caching_ioctl(struct drm_device *dev, void *data,
 		goto out;
 	}
 
-	switch (obj->cache_level) {
-	case I915_CACHE_LLC:
-	case I915_CACHE_L3_LLC:
+	if (i915_gem_object_has_cache_level(obj, I915_CACHE_LLC) ||
+	    i915_gem_object_has_cache_level(obj, I915_CACHE_L3_LLC))
 		args->caching = I915_CACHING_CACHED;
-		break;
-
-	case I915_CACHE_WT:
+	else if (i915_gem_object_has_cache_level(obj, I915_CACHE_WT))
 		args->caching = I915_CACHING_DISPLAY;
-		break;
-
-	default:
+	else
 		args->caching = I915_CACHING_NONE;
-		break;
-	}
 out:
 	rcu_read_unlock();
 	return err;
@@ -331,6 +325,9 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
 
 	if (IS_DGFX(i915))
 		return -ENODEV;
+
+	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70))
+		return -EOPNOTSUPP;
 
 	switch (args->caching) {
 	case I915_CACHING_NONE:
@@ -397,7 +394,7 @@ struct i915_vma *
 i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
 				     struct i915_gem_ww_ctx *ww,
 				     u32 alignment,
-				     const struct i915_ggtt_view *view,
+				     const struct i915_gtt_view *view,
 				     unsigned int flags)
 {
 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
@@ -424,6 +421,17 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
 	if (ret)
 		return ERR_PTR(ret);
 
+	/* VT-d may overfetch before/after the vma, so pad with scratch */
+	if (intel_scanout_needs_vtd_wa(i915)) {
+		unsigned int guard = VTD_GUARD;
+
+		if (i915_gem_object_is_tiled(obj))
+			guard = max(guard,
+				    i915_gem_object_get_tile_row_size(obj));
+
+		flags |= PIN_OFFSET_GUARD | guard;
+	}
+
 	/*
 	 * As the user may map the buffer once pinned in the display plane
 	 * (e.g. libkms for the bootup splash), we have to ensure that we
@@ -434,7 +442,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
 	 */
 	vma = ERR_PTR(-ENOSPC);
 	if ((flags & PIN_MAPPABLE) == 0 &&
-	    (!view || view->type == I915_GGTT_VIEW_NORMAL))
+	    (!view || view->type == I915_GTT_VIEW_NORMAL))
 		vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment,
 						  flags | PIN_MAPPABLE |
 						  PIN_NONBLOCK);
@@ -444,7 +452,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
 	if (IS_ERR(vma))
 		return vma;
 
-	vma->display_alignment = max_t(u64, vma->display_alignment, alignment);
+	vma->display_alignment = max(vma->display_alignment, alignment);
 	i915_vma_mark_scanout(vma);
 
 	i915_gem_object_flush_if_display_locked(obj);

@@ -111,42 +111,39 @@ bool i915_error_injected(void);
 #define range_overflows_end_t(type, start, size, max) \
 	range_overflows_end((type)(start), (type)(size), (type)(max))
 
+#ifndef overflows_type
 /* Note we don't consider signbits :| */
 #define overflows_type(x, T) \
 	(sizeof(x) > sizeof(T) && (x) >> BITS_PER_TYPE(T))
+#endif
 
-static inline bool
-__check_struct_size(size_t base, size_t arr, size_t count, size_t *size)
-{
-	size_t sz;
+#ifndef __overflows_type_constexpr
+#define is_unsigned_type(type) (!is_signed_type(type))
+#define __overflows_type_constexpr(x, T) (			\
+	is_unsigned_type(typeof(x)) ?				\
+		(x) > type_max(typeof(T)) :			\
+	is_unsigned_type(typeof(T)) ?				\
+		(x) < 0 || (x) > type_max(typeof(T)) :		\
+	(x) < type_min(typeof(T)) || (x) > type_max(typeof(T)))
+#endif
 
-	if (check_mul_overflow(count, arr, &sz))
-		return false;
+#ifndef castable_to_type
+#define castable_to_type(n, T)						\
+	__builtin_choose_expr(__is_constexpr(n),			\
+			      !__overflows_type_constexpr(n, T),	\
+			      __same_type(n, T))
+#endif
 
-	if (check_add_overflow(sz, base, &sz))
-		return false;
-
-	*size = sz;
-	return true;
-}
-
-/**
- * check_struct_size() - Calculate size of structure with trailing array.
- * @p: Pointer to the structure.
- * @member: Name of the array member.
- * @n: Number of elements in the array.
- * @sz: Total size of structure and array
- *
- * Calculates size of memory needed for structure @p followed by an
- * array of @n @member elements, like struct_size() but reports
- * whether it overflowed, and the resultant size in @sz
- *
- * Return: false if the calculation overflowed.
- */
-#define check_struct_size(p, member, n, sz) \
-	likely(__check_struct_size(sizeof(*(p)), \
-				   sizeof(*(p)->member) + __must_be_array((p)->member), \
-				   n, sz))
+#ifndef check_round_up_overflow
+#define check_round_up_overflow(a, b, d) __must_check_overflow(({		\
+	typeof(a) __a = (a);							\
+	typeof(b) __b = (b);							\
+	typeof(d) __d = (d);							\
+	(void) (&__a == &__b);							\
+	(void) (&__a == __d);							\
+	(*__d = __a) && __builtin_add_overflow((__a-1) | (__b-1), 1, __d);	\
+}))
+#endif
 
 #define ptr_mask_bits(ptr, n) ({					\
 	unsigned long __v = (unsigned long)(ptr);			\
@@ -182,10 +179,6 @@ __check_struct_size(size_t base, size_t arr, size_t count, size_t *size)
 #define page_pack_bits(ptr, bits) ptr_pack_bits(ptr, bits, PAGE_SHIFT)
 #define page_unpack_bits(ptr, bits) ptr_unpack_bits(ptr, bits, PAGE_SHIFT)
 
-#define struct_member(T, member) (((T *)0)->member)
-
-#define ptr_offset(ptr, member) offsetof(typeof(*(ptr)), member)
-
 #define fetch_and_zero(ptr) ({						\
 	typeof(*ptr) __T = *(ptr);					\
 	*(ptr) = (typeof(*ptr))0;					\
@@ -205,7 +198,7 @@ static __always_inline ptrdiff_t ptrdiff(const void *a, const void *b)
  */
 #define container_of_user(ptr, type, member) ({				\
 	void __user *__mptr = (void __user *)(ptr);			\
-	BUILD_BUG_ON_MSG(!__same_type(*(ptr), struct_member(type, member)) && \
+	BUILD_BUG_ON_MSG(!__same_type(*(ptr), typeof_member(type, member)) && \
 			 !__same_type(*(ptr), void),			\
 			 "pointer type mismatch in container_of()");	\
 	((type __user *)(__mptr - offsetof(type, member))); })
@@ -227,11 +220,6 @@ static __always_inline ptrdiff_t ptrdiff(const void *a, const void *b)
 	typeof(*(U)) mbz__;						\
 	get_user(mbz__, (U)) ? -EFAULT : mbz__ ? -EINVAL : 0;		\
 })
-
-static inline u64 ptr_to_u64(const void *ptr)
-{
-	return (uintptr_t)ptr;
-}
 
 #define u64_to_ptr(T, x) ({						\
 	typecheck(u64, x);						\
@@ -400,10 +388,6 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
 #define KHz(x) (1000 * (x))
 #define MHz(x) KHz(1000 * (x))
 
-#define KBps(x) (1000 * (x))
-#define MBps(x) KBps(1000 * (x))
-#define GBps(x) ((u64)1000 * MBps((x)))
-
 void add_taint_for_CI(struct drm_i915_private *i915, unsigned int taint);
 static inline void __add_taint_for_CI(unsigned int taint)
 {
@@ -441,9 +425,6 @@ static inline bool i915_run_as_guest(void)
 
 bool i915_vtd_active(struct drm_i915_private *i915);
 
-#define make_u64(hi__, low__)  ((u64)(hi__) << 32 | (u64)(low__))
-
-int from_user_to_u32array(const char __user *from, size_t count,
-			  u32 *array, unsigned int size);
+#define make_u64(hi__, low__) ((u64)(hi__) << 32 | (low__))
 
 #endif /* !__I915_UTILS_H */

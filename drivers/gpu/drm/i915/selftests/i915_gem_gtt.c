@@ -27,6 +27,7 @@
 
 #include "gem/i915_gem_context.h"
 #include "gem/i915_gem_internal.h"
+#include "gem/i915_gem_lmem.h"
 #include "gem/i915_gem_region.h"
 #include "gem/selftests/mock_context.h"
 #include "gt/intel_context.h"
@@ -60,7 +61,6 @@ static int fake_get_pages(struct drm_i915_gem_object *obj)
 #define PFN_BIAS 0x1000
 	struct sg_table *pages;
 	struct scatterlist *sg;
-	unsigned int sg_page_sizes;
 	typeof(obj->base.size) rem;
 
 	pages = kmalloc(sizeof(*pages), GFP);
@@ -68,12 +68,15 @@ static int fake_get_pages(struct drm_i915_gem_object *obj)
 		return -ENOMEM;
 
 	rem = round_up(obj->base.size, BIT(31)) >> 31;
+	/* restricted by sg_alloc_table */
+	if (overflows_type(rem, unsigned int))
+		return -E2BIG;
+
 	if (sg_alloc_table(pages, rem, GFP)) {
 		kfree(pages);
 		return -ENOMEM;
 	}
 
-	sg_page_sizes = 0;
 	rem = obj->base.size;
 	for (sg = pages->sgl; sg; sg = sg_next(sg)) {
 		unsigned long len = min_t(typeof(rem), rem, BIT(31));
@@ -82,13 +85,12 @@ static int fake_get_pages(struct drm_i915_gem_object *obj)
 		sg_set_page(sg, pfn_to_page(PFN_BIAS), len, 0);
 		sg_dma_address(sg) = page_to_phys(sg_page(sg));
 		sg_dma_len(sg) = len;
-		sg_page_sizes |= len;
 
 		rem -= len;
 	}
 	GEM_BUG_ON(rem);
 
-	__i915_gem_object_set_pages(obj, pages, sg_page_sizes);
+	__i915_gem_object_set_pages(obj, pages);
 
 	return 0;
 #undef GFP
@@ -131,7 +133,7 @@ fake_dma_object(struct drm_i915_private *i915, u64 size)
 
 	obj->write_domain = I915_GEM_DOMAIN_CPU;
 	obj->read_domains = I915_GEM_DOMAIN_CPU;
-	obj->cache_level = I915_CACHE_NONE;
+	obj->pat_index = i915_gem_get_pat_index(i915, I915_CACHE_NONE);
 
 	/* Preallocate the "backing storage" */
 	if (i915_gem_object_pin_pages_unlocked(obj))
@@ -355,7 +357,9 @@ alloc_vm_end:
 
 			with_intel_runtime_pm(vm->gt->uncore->rpm, wakeref)
 			  vm->insert_entries(vm, mock_vma_res,
-						   I915_CACHE_NONE, 0);
+					     i915_gem_get_pat_index(vm->i915,
+						     I915_CACHE_NONE),
+					     0);
 		}
 		count = n;
 
@@ -742,7 +746,7 @@ static int pot_hole(struct i915_address_space *vm,
 		u64 addr;
 
 		for (addr = round_up(hole_start + min_alignment, step) - min_alignment;
-		     addr <= round_down(hole_end - (2 * min_alignment), step) - min_alignment;
+		     hole_end > addr && hole_end - addr >= 2 * min_alignment;
 		     addr += step) {
 			err = i915_vma_pin(vma, 0, 0, addr | flags);
 			if (err) {
@@ -1080,7 +1084,7 @@ static int misaligned_case(struct i915_address_space *vm, struct intel_memory_re
 	bool is_stolen = mr->type == INTEL_MEMORY_STOLEN_SYSTEM ||
 			 mr->type == INTEL_MEMORY_STOLEN_LOCAL;
 
-	obj = i915_gem_object_create_region(mr, size, 0, 0);
+	obj = i915_gem_object_create_region(mr, size, 0, I915_BO_ALLOC_GPU_ONLY);
 	if (IS_ERR(obj)) {
 		/* if iGVT-g or DMAR is active, stolen mem will be uninitialized */
 		if (PTR_ERR(obj) == -ENODEV && is_stolen)
@@ -1113,15 +1117,8 @@ static int misaligned_case(struct i915_address_space *vm, struct intel_memory_re
 	expected_node_size = expected_vma_size;
 
 	if (HAS_64K_PAGES(vm->i915) && i915_gem_object_is_lmem(obj)) {
-		/*
-		 * The compact-pt should expand lmem node to 2MB for the ppGTT,
-		 * for all other cases we should only expect 64K.
-		 */
 		expected_vma_size = round_up(size, I915_GTT_PAGE_SIZE_64K);
-		if (NEEDS_COMPACT_PT(vm->i915) && !i915_is_ggtt(vm))
-			expected_node_size = round_up(size, I915_GTT_PAGE_SIZE_2M);
-		else
-			expected_node_size = round_up(size, I915_GTT_PAGE_SIZE_64K);
+		expected_node_size = round_up(size, I915_GTT_PAGE_SIZE_64K);
 	}
 
 	if (vma->size != expected_vma_size || vma->node.size != expected_node_size) {
@@ -1380,7 +1377,10 @@ static int igt_ggtt_page(void *arg)
 
 		ggtt->vm.insert_page(&ggtt->vm,
 				     i915_gem_object_get_dma_address(obj, 0),
-				     offset, I915_CACHE_NONE, 0);
+				     offset,
+				     i915_gem_get_pat_index(i915,
+							    I915_CACHE_NONE),
+				     0);
 	}
 
 	order = i915_random_order(count, &prng);
@@ -1513,7 +1513,7 @@ static int reserve_gtt_with_resource(struct i915_vma *vma, u64 offset)
 	mutex_lock(&vm->mutex);
 	err = i915_gem_gtt_reserve(vm, NULL, &vma->node, obj->base.size,
 				   offset,
-				   obj->cache_level,
+				   obj->pat_index,
 				   0);
 	if (!err) {
 		i915_vma_resource_init_from_vma(vma_res, vma);
@@ -1693,7 +1693,7 @@ static int insert_gtt_with_resource(struct i915_vma *vma)
 
 	mutex_lock(&vm->mutex);
 	err = i915_gem_gtt_insert(vm, NULL, &vma->node, obj->base.size, 0,
-				  obj->cache_level, 0, vm->total, 0);
+				  obj->pat_index, 0, vm->total, 0);
 	if (!err) {
 		i915_vma_resource_init_from_vma(vma_res, vma);
 		vma->resource = vma_res;
@@ -2324,5 +2324,5 @@ int i915_gem_gtt_live_selftests(struct drm_i915_private *i915)
 
 	GEM_BUG_ON(offset_in_page(to_gt(i915)->ggtt->vm.total));
 
-	return i915_subtests(tests, i915);
+	return i915_live_subtests(tests, i915);
 }

@@ -18,6 +18,49 @@
 #include "i915_scatterlist.h"
 #include "i915_trace.h"
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
+/*
+ * Move folios to appropriate lru and release the batch, decrementing the
+ * ref count of those folios.
+ */
+static void check_release_folio_batch(struct folio_batch *fbatch)
+{
+	check_move_unevictable_folios(fbatch);
+	__folio_batch_release(fbatch);
+	cond_resched();
+}
+
+void shmem_sg_free_table(struct sg_table *st, struct address_space *mapping,
+			 bool dirty, bool backup)
+{
+	struct sgt_iter sgt_iter;
+	struct folio_batch fbatch;
+	struct folio *last = NULL;
+	struct page *page;
+
+	mapping_clear_unevictable(mapping);
+
+	folio_batch_init(&fbatch);
+	for_each_sgt_page(page, sgt_iter, st) {
+		struct folio *folio = page_folio(page);
+
+		if (folio == last)
+			continue;
+		last = folio;
+		if (dirty)
+			folio_mark_dirty(folio);
+		if (backup)
+			folio_mark_accessed(folio);
+
+		if (!folio_batch_add(&fbatch, folio))
+			check_release_folio_batch(&fbatch);
+	}
+	if (fbatch.nr)
+		check_release_folio_batch(&fbatch);
+
+	sg_free_table(st);
+}
+#else
 /*
  * Move pages to appropriate lru and release the pagevec, decrementing the
  * ref count of those pages.
@@ -54,13 +97,14 @@ void shmem_sg_free_table(struct sg_table *st, struct address_space *mapping,
 
 	sg_free_table(st);
 }
+#endif
 
 int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 			 size_t size, struct intel_memory_region *mr,
 			 struct address_space *mapping,
 			 unsigned int max_segment)
 {
-	const unsigned long page_count = size / PAGE_SIZE;
+	unsigned int page_count; /* restricted by sg_alloc_table */
 	unsigned long i;
 	struct scatterlist *sg;
 	struct page *page;
@@ -68,6 +112,10 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 	gfp_t noreclaim;
 	int ret;
 
+	if (overflows_type(size / PAGE_SIZE, page_count))
+		return -E2BIG;
+
+	page_count = size / PAGE_SIZE;
 	/*
 	 * If there's no chance of allocating enough pages for the whole
 	 * object, bail early.
@@ -75,7 +123,7 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 	if (size > resource_size(&mr->region))
 		return -ENOMEM;
 
-	if (sg_alloc_table(st, page_count, GFP_KERNEL))
+	if (sg_alloc_table(st, page_count, GFP_KERNEL | __GFP_NOWARN))
 		return -ENOMEM;
 
 	/*
@@ -137,7 +185,7 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 				 * trigger the out-of-memory killer and for
 				 * this we want __GFP_RETRY_MAYFAIL.
 				 */
-				gfp |= __GFP_RETRY_MAYFAIL;
+				gfp |= __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
 			}
 		} while (1);
 
@@ -193,8 +241,7 @@ static int shmem_get_pages(struct drm_i915_gem_object *obj)
 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
 	struct intel_memory_region *mem = obj->mm.region;
 	struct address_space *mapping = obj->base.filp->f_mapping;
-	const unsigned long page_count = obj->base.size / PAGE_SIZE;
-	unsigned int max_segment = i915_sg_segment_size();
+	unsigned int max_segment = i915_sg_segment_size(i915->drm.dev);
 	struct sg_table *st;
 	struct sgt_iter sgt_iter;
 	struct page *page;
@@ -209,7 +256,7 @@ static int shmem_get_pages(struct drm_i915_gem_object *obj)
 	GEM_BUG_ON(obj->write_domain & I915_GEM_GPU_DOMAINS);
 
 rebuild_st:
-	st = kmalloc(sizeof(*st), GFP_KERNEL);
+	st = kmalloc(sizeof(*st), GFP_KERNEL | __GFP_NOWARN);
 	if (!st)
 		return -ENOMEM;
 
@@ -235,8 +282,8 @@ rebuild_st:
 			goto rebuild_st;
 		} else {
 			dev_warn(i915->drm.dev,
-				 "Failed to DMA remap %lu pages\n",
-				 page_count);
+				 "Failed to DMA remap %zu pages\n",
+				 obj->base.size >> PAGE_SHIFT);
 			goto err_pages;
 		}
 	}
@@ -247,7 +294,7 @@ rebuild_st:
 	if (i915_gem_object_can_bypass_llc(obj))
 		obj->cache_dirty = true;
 
-	__i915_gem_object_set_pages(obj, st, i915_sg_dma_sizes(st->sgl));
+	__i915_gem_object_set_pages(obj, st);
 
 	return 0;
 
@@ -369,14 +416,14 @@ __i915_gem_object_release_shmem(struct drm_i915_gem_object *obj,
 
 	__start_cpu_write(obj);
 	/*
-	 * On non-LLC platforms, force the flush-on-acquire if this is ever
+	 * On non-LLC igfx platforms, force the flush-on-acquire if this is ever
 	 * swapped-in. Our async flush path is not trust worthy enough yet(and
 	 * happens in the wrong order), and with some tricks it's conceivable
 	 * for userspace to change the cache-level to I915_CACHE_NONE after the
 	 * pages are swapped-in, and since execbuf binds the object before doing
 	 * the async flush, we have a race window.
 	 */
-	if (!HAS_LLC(i915))
+	if (!HAS_LLC(i915) && !IS_DGFX(i915))
 		obj->cache_dirty = true;
 }
 
@@ -538,6 +585,20 @@ static int __create_shmem(struct drm_i915_private *i915,
 
 	drm_gem_private_object_init(&i915->drm, obj, size);
 
+	/* XXX: The __shmem_file_setup() function returns -EINVAL if size is
+	 * greater than MAX_LFS_FILESIZE.
+	 * To handle the same error as other code that returns -E2BIG when
+	 * the size is too large, we add a code that returns -E2BIG when the
+	 * size is larger than the size that can be handled.
+	 * If BITS_PER_LONG is 32, size > MAX_LFS_FILESIZE is always false,
+	 * so we only needs to check when BITS_PER_LONG is 64.
+	 * If BITS_PER_LONG is 32, E2BIG checks are processed when
+	 * i915_gem_object_size_2big() is called before init_object() callback
+	 * is called.
+	 */
+	if (BITS_PER_LONG == 64 && size > MAX_LFS_FILESIZE)
+		return -E2BIG;
+
 	if (i915->mm.gemfs)
 		filp = shmem_file_setup_with_mnt(i915->mm.gemfs, "i915", size,
 						 flags);
@@ -579,12 +640,17 @@ static int shmem_object_init(struct intel_memory_region *mem,
 	mapping_set_gfp_mask(mapping, mask);
 	GEM_BUG_ON(!(mapping_gfp_mask(mapping) & __GFP_RECLAIM));
 
-	i915_gem_object_init(obj, &i915_gem_shmem_ops, &lock_class, 0);
+	i915_gem_object_init(obj, &i915_gem_shmem_ops, &lock_class, flags);
 	obj->mem_flags |= I915_BO_FLAG_STRUCT_PAGE;
 	obj->write_domain = I915_GEM_DOMAIN_CPU;
 	obj->read_domains = I915_GEM_DOMAIN_CPU;
 
-	if (HAS_LLC(i915))
+	/*
+	 * Soft-pinned buffers need to be 1-way coherent from MTL onward
+	 * because GPU is no longer snooping CPU cache by default. Make it
+	 * default setting and let others to modify as needed later
+	 */
+	if (HAS_LLC(i915) || (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70)))
 		/* On some devices, we can have the GPU use the LLC (the CPU
 		 * cache) for about a 10% performance improvement
 		 * compared to uncached.  Graphics requests other than
@@ -670,17 +736,10 @@ fail:
 
 static int init_shmem(struct intel_memory_region *mem)
 {
-	int err;
-
-	err = i915_gemfs_init(mem->i915);
-	if (err) {
-		DRM_NOTE("Unable to create a private tmpfs mount, hugepage support will be disabled(%d).\n",
-			 err);
-	}
-
+	i915_gemfs_init(mem->i915);
 	intel_memory_region_set_name(mem, "system");
 
-	return 0; /* Don't error, we can simply fallback to the kernel mnt */
+	return 0; /* We have fallback to the kernel mnt if gemfs init failed. */
 }
 
 static int release_shmem(struct intel_memory_region *mem)

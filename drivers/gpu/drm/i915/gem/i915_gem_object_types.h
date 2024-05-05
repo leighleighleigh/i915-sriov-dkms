@@ -8,9 +8,14 @@
 #define __I915_GEM_OBJECT_TYPES_H__
 
 #include <linux/mmu_notifier.h>
+#include <linux/version.h>
 
 #include <drm/drm_gem.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
+#include <drm/ttm/ttm_bo.h>
+#else
 #include <drm/ttm/ttm_bo_api.h>
+#endif
 #include <uapi/drm/i915_drm.h>
 
 #include "i915_active.h"
@@ -107,7 +112,8 @@ struct drm_i915_gem_object_ops {
 	 * pinning or for as long as the object lock is held.
 	 */
 	int (*migrate)(struct drm_i915_gem_object *obj,
-		       struct intel_memory_region *mr);
+		       struct intel_memory_region *mr,
+		       unsigned int flags);
 
 	void (*release)(struct drm_i915_gem_object *obj);
 
@@ -193,6 +199,8 @@ enum i915_cache_level {
 	 * engine.
 	 */
 	I915_CACHE_WT,
+	I915_MAX_CACHE_LEVEL,
+	I915_CACHE_INVAL,
 };
 
 enum i915_map_type {
@@ -298,7 +306,8 @@ struct drm_i915_gem_object {
 	};
 
 	/**
-	 * Whether the object is currently in the GGTT mmap.
+	 * Whether the object is currently in the GGTT or any other supported
+	 * fake offset mmap backed by lmem.
 	 */
 	unsigned int userfault_count;
 	struct list_head userfault_link;
@@ -325,18 +334,18 @@ struct drm_i915_gem_object {
  * dealing with userspace objects the CPU fault handler is free to ignore this.
  */
 #define I915_BO_ALLOC_GPU_ONLY	  BIT(6)
+#define I915_BO_ALLOC_CCS_AUX	  BIT(7)
 #define I915_BO_ALLOC_FLAGS (I915_BO_ALLOC_CONTIGUOUS | \
 			     I915_BO_ALLOC_VOLATILE | \
 			     I915_BO_ALLOC_CPU_CLEAR | \
 			     I915_BO_ALLOC_USER | \
 			     I915_BO_ALLOC_PM_VOLATILE | \
 			     I915_BO_ALLOC_PM_EARLY | \
-			     I915_BO_ALLOC_GPU_ONLY)
-#define I915_BO_READONLY          BIT(7)
-#define I915_TILING_QUIRK_BIT     8 /* unknown swizzling; do not release! */
-#define I915_BO_PROTECTED         BIT(9)
-#define I915_BO_WAS_BOUND_BIT     10
-
+			     I915_BO_ALLOC_GPU_ONLY | \
+			     I915_BO_ALLOC_CCS_AUX)
+#define I915_BO_READONLY          BIT(8)
+#define I915_TILING_QUIRK_BIT     9 /* unknown swizzling; do not release! */
+#define I915_BO_PROTECTED         BIT(10)
 	/**
 	 * @mem_flags - Mutable placement-related flags
 	 *
@@ -348,10 +357,28 @@ struct drm_i915_gem_object {
 #define I915_BO_FLAG_STRUCT_PAGE BIT(0) /* Object backed by struct pages */
 #define I915_BO_FLAG_IOMEM       BIT(1) /* Object backed by IO memory */
 	/**
-	 * @cache_level: The desired GTT caching level.
+	 * @pat_index: The desired PAT index.
 	 *
-	 * See enum i915_cache_level for possible values, along with what
-	 * each does.
+	 * See hardware specification for valid PAT indices for each platform.
+	 * This field used to contain a value of enum i915_cache_level. It's
+	 * changed to an unsigned int because PAT indices are being used by
+	 * both UMD and KMD for caching policy control after GEN12.
+	 * For backward compatibility, this field will continue to contain
+	 * value of i915_cache_level for pre-GEN12 platforms so that the PTE
+	 * encode functions for these legacy platforms can stay the same.
+	 * In the meantime platform specific tables are created to translate
+	 * i915_cache_level into pat index, for more details check the macros
+	 * defined i915/i915_pci.c, e.g. PVC_CACHELEVEL.
+	 */
+	unsigned int pat_index:6;
+	/**
+	 * @cache_level: Indicate whether pat_index is set by UMD
+	 *
+	 * This used to hold desired GTT caching level, but is now replaced by
+	 * pat_index. It's kept here for KMD to tell whether the pat_index is
+	 * set by UMD or converted from enum i915_cache_level.
+	 * This field should be 0 by default, but I915_CACHE_INVAL if the
+	 * pat_index is set by UMD.
 	 */
 	unsigned int cache_level:3;
 	/**
@@ -489,6 +516,9 @@ struct drm_i915_gem_object {
 	 */
 	unsigned int cache_dirty:1;
 
+	/* @is_dpt: Object houses a display page table (DPT) */
+	unsigned int is_dpt:1;
+
 	/**
 	 * @read_domains: Read memory domains.
 	 *
@@ -549,6 +579,24 @@ struct drm_i915_gem_object {
 		bool ttm_shrinkable;
 
 		/**
+		 * @unknown_state: Indicate that the object is effectively
+		 * borked. This is write-once and set if we somehow encounter a
+		 * fatal error when moving/clearing the pages, and we are not
+		 * able to fallback to memcpy/memset, like on small-BAR systems.
+		 * The GPU should also be wedged (or in the process) at this
+		 * point.
+		 *
+		 * Only valid to read this after acquiring the dma-resv lock and
+		 * waiting for all DMA_RESV_USAGE_KERNEL fences to be signalled,
+		 * or if we otherwise know that the moving fence has signalled,
+		 * and we are certain the pages underneath are valid for
+		 * immediate access (under normal operation), like just prior to
+		 * binding the object or when setting up the CPU fault handler.
+		 * See i915_gem_object_has_unknown_state();
+		 */
+		bool unknown_state;
+
+		/**
 		 * Priority list of potential placements for this object.
 		 */
 		struct intel_memory_region **placements;
@@ -599,6 +647,8 @@ struct drm_i915_gem_object {
 		 * pages were last acquired.
 		 */
 		bool dirty:1;
+
+		u32 tlb;
 	} mm;
 
 	struct {
